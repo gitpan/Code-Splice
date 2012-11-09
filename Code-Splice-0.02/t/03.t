@@ -8,6 +8,7 @@ use Code::Splice;
 {
     my $x = 10;
     Code::Splice::inject(
+        # debug => 1,
         package => 'main', method => 'test',
         code => sub { 
             "blurgh";

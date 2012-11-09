@@ -4,7 +4,7 @@ use 5.008;
 use strict;
 use warnings;
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 
 <<comment;
 
@@ -33,11 +33,6 @@ sub SVs_PADMY () { 0x00000400 }     # use B qw< SVs_PADMY >;
 
 use strict;
 use warnings;
-
-sub OPfDEREF    () { 32|64 } # #define OPpDEREF                (32|64) /* autovivify: Want ref to something: */
-sub OPfDEREF_AV () { 32 }    # #define OPpDEREF_AV             32      /*   Want ref to AV. */
-sub OPfDEREF_HV () { 64 }    # #define OPpDEREF_HV             64      /*   Want ref to HV. */
-sub OPfDEREF_SV () { 32|64 } # #define OPpDEREF_SV             (32|64) /*   Want ref to SV. */
 
 #
 # debugging
@@ -103,32 +98,54 @@ sub inject {
 
     my $cv = do { no strict 'refs'; B::svref_2object(*{$package.'::'.$method}{CODE} or die "no such package/method"); }; 
     $cv->ROOT() or die "no code in $package\::method";
-    $cv->STASH()->isa('B::SPECIAL') and die; # Can't locate object method "NAME" via package "B::SPECIAL"
+    $cv->STASH()->isa('B::SPECIAL') and die "can't splice into binary compiled XS code you twit"; # Can't locate object method "NAME" via package "B::SPECIAL"
     $cv->ROOT()->can('first') or die "$package\::$method cannot do ->ROOT->first\n"; 
 
     # Ready the code we're support to inject
 
     # Code we're to insert should have a structure as follows:
 
-    # 5  <1> leavesub[1 ref] K/REFC,1 ->(end)
+    # 5  <1> leavesub[1 ref] K/REFC,1 ->(end)                                     <--- $newop
     # -     <@> lineseq KP ->5
     # 1        <;> nextstate(splice 38 splice.pm:99) v/2 ->2
-    # 4        <@> print sK ->5
+    # 4        <@> print sK ->5                                                   <--- $newopfirst ( $newop->first->first->sibling ); also $newlastop here
     # 2           <0> pushmark s ->3
     # 3           <$> const(PV "test!!\n") s ->4
 
     # We want the nextstate and all of its siblings (print, another nextstate perhaps, more stuff...)
 
     my $newcv = B::svref_2object($code);
+    $debug and do { print "\n\ncode to splice:\n"; B::Concise::concise_cv_obj('basic', $newcv); }; # dump the opcode tree of this code value
     my $newop = $newcv->ROOT;                            # $newop points to a leavesub instruction
     $newop->name eq 'leavesub' or die;
     my $newopfirst = $newop->first->first;  $newopfirst = $newopfirst->has_sibling if $newopfirst->has_sibling and $newopfirst->name  eq 'nextstate'; # was causing coredumps when the nextstate was inserted into the wrong place
     my $newoplast = do { my $x = $newopfirst; $x = $x->has_sibling while $x->has_sibling; $x; };
 
-    # Get ready to recurse through the bytecode tree - build a reverse index, previous, from the next
-    # links and do any debugging output after we traverse the tree
+    # XXXX moved rewrite pad entries
 
-    my @nonrootpad = ($cv->PADLIST->ARRAY)[0]->ARRAY;
+    my @srcpad = lexicals($newcv);
+    my @destpad = lexicals($cv); 
+
+    my %destpad = map { ( $destpad[$_] => $_ ) } grep defined $destpad[$_], 0 .. $#destpad; # build a name-to-number index
+
+    # map { ( $_ => $padnames[$_]->PVX) }  grep { ! $padnames[$_]->isa('B::SPECIAL') } 0 .. $#padnames;
+
+    $debug and do { print "debug: srcpad: ", join ', ', map $_||'(undef)', @srcpad; print "\n"; };
+    $debug and do { print "debug: destpad: ", join ', ', map $_||'(undef)', @destpad; print "\n"; };
+
+    # Translate the spliced-in code's idea of lexicals to match where it's spliced in to
+
+    walkoptree_slow($newcv->ROOT, sub {
+        my $op = shift or die;       # op object
+# warn "rewriting pad looking at an: " . B::class($op);
+        $op->can('targ') or return;  # B::NULL cannot
+        $srcpad[$op->targ] or return; 
+        $debug and print "debug: ", $op->name, " references pad slot ", $op->targ, " which contains ", $srcpad[$op->targ]||'', "\n";
+        exists $destpad{$srcpad[$op->targ]} or die "variable ``$srcpad[$op->targ]'' doesn't exist in target context";
+        $op->targ($destpad{$srcpad[$op->targ]});
+        # print "debug: variable name: $srcpad[$op->targ]\n";
+        # print "debug: index of same variable in dest: ", $destpad{$srcpad{$op->targ}}, "\n";
+    }); 
 
     my $redo_reverse_indices = sub {
         my $siblings = { };
@@ -140,6 +157,8 @@ sub inject {
         });
         return $siblings;
     };
+
+    # Get ready to recurse through the bytecode tree - build a reverse index, previous, from the next link
 
     my $siblings = $redo_reverse_indices->();
 
@@ -189,15 +208,16 @@ sub inject {
     
         my $pointcut = sub {
     
-            # When splicing bytecode, we must consider: parent's first, parent's last, our previous sibling, our next sibling
+            # When splicing bytecode, we must consider the parent's first, parent's last, our previous sibling, our next sibling
+            # That ignores threading next, which gets done later
+
             # print "modifying ", $op->name, " at addresss ", $$op, "\n";
-    
+
             # XXX alternate between the two according to some test
-            # XXX rewrite the graphed in code so that targs refer to lexicals in the scope of the CV they're being spliced into
-    
+
             my $prev_sibling = $siblings->{$$op}; # may be undef
             my $next_sibling = $op->sibling;      # may be undef
-    
+
             $prev_sibling->sibling($newopfirst) if $prev_sibling and $$prev_sibling;
             $newoplast->sibling($op->sibling) if $op->sibling and ${$op->sibling};
     
@@ -244,32 +264,34 @@ sub inject {
     die "pointcut failed";
     did_pointcut:
 
+    # re-thread next:
+
     fix($cv->ROOT->first, $cv->ROOT);
 
+#    my @srcpad = lexicals($newcv);
+#    my @destpad = lexicals($cv); 
+#
+#    my %destpad = map { ( $destpad[$_] => $_ ) } grep defined $destpad[$_], 0 .. $#destpad; # build a name-to-number index
+#
+#    # map { ( $_ => $padnames[$_]->PVX) }  grep { ! $padnames[$_]->isa('B::SPECIAL') } 0 .. $#padnames;
+#
+#    $debug and do { print "debug: srcpad: ", join ', ', map $_||'(undef)', @srcpad; print "\n"; };
+#    $debug and do { print "debug: destpad: ", join ', ', map $_||'(undef)', @destpad; print "\n"; };
+
+# original version of pad rewriting:
+#    walkoptree_slow($cv->ROOT, sub {
+#        my $op = shift or die;       # op object
+#        $op->can('targ') or return;  # B::NULL cannot
+#        $srcpad[$op->targ] or return; 
+#        $debug and print "debug: ", $op->name, " references pad slot ", $op->targ, " which contains ", $srcpad[$op->targ]||'', "\n";
+#        exists $destpad{$srcpad[$op->targ]} or die "variable ``$srcpad[$op->targ]'' doesn't exist in target context";
+#        $op->targ($destpad{$srcpad[$op->targ]});
+#        # print "debug: variable name: $srcpad[$op->targ]\n";
+#        # print "debug: index of same variable in dest: ", $destpad{$srcpad{$op->targ}}, "\n";
+#    }); 
+# that's not working either now...
+
     $debug and do { print "\n\nafter:\n"; B::Concise::concise_cv_obj('basic', $cv); }; # dump the opcode tree of this code value
-
-    # Translate the spliced-in code's idea of lexicals to match where it's spliced in to
-
-    my @srcpad = lexicals($newcv);
-    my @destpad = lexicals($cv); 
-
-    my %destpad = map { ( $destpad[$_] => $_ ) } grep defined $destpad[$_], 0 .. $#destpad; # build a name-to-number index
-
-    # map { ( $_ => $padnames[$_]->PVX) }  grep { ! $padnames[$_]->isa('B::SPECIAL') } 0 .. $#padnames;
-
-    $debug and do { print "debug: srcpad: ", join ', ', map $_||'(undef)', @srcpad; print "\n"; };
-    $debug and do { print "debug: destpad: ", join ', ', map $_||'(undef)', @destpad; print "\n"; };
-
-    walkoptree_slow($cv->ROOT, sub {
-        my $op = shift or die;       # op object
-        $op->can('targ') or return;  # B::NULL cannot
-        $srcpad[$op->targ] or return;
-        $debug and print "debug: ", $op->name, " references pad slot ", $op->targ, " which contains ", $srcpad[$op->targ]||'', "\n";
-        exists $destpad{$srcpad[$op->targ]} or die "variable ``$srcpad[$op->targ]'' doesn't exist in target context";
-        $op->targ($destpad{$srcpad[$op->targ]});
-        # print "debug: variable name: $srcpad[$op->targ]\n";
-        # print "debug: index of same variable in dest: ", $destpad{$srcpad{$op->targ}}, "\n";
-    });
 
     return 1;
 }
@@ -287,8 +309,11 @@ sub walkoptree_slow {
     my $op = shift;
     my $sub = shift;
     my $level = shift;
+
     $level ||= 0;
-    # warn(sprintf("walkoptree: %d. %s\n", $level, peekop($op))) if $debug;
+
+    # warn "walkoptree_debug: $level " . $op->name if our($walkoptree_debug) and $op and $$op;
+
     $sub->($op, $level, \@parents);
     if ($op->can('flags') and $op->flags() & OPf_KIDS) {
         # print "debug: go: ", '  ' x $level, $op->name(), "\n"; # debug
@@ -361,7 +386,6 @@ sub denull {
 
 sub lexicals {
     my $cv = shift;
-    # map { ( $_ => $padnames[$_]->PVX) }  grep { ! $padnames[$_]->isa('B::SPECIAL') } 0 .. $#padnames;
     map { $_->isa('B::SPECIAL') ? undef : $_->PVX } ($cv->PADLIST->ARRAY)[0]->ARRAY;
 }
 
@@ -537,28 +561,6 @@ at your option, any later version of Perl 5 you may have available.
 
 __END__
 
-        #for my $i ( 0 .. $#padnames ) {
-        #    $padnames[$i]->isa('B::SPECIAL') and next;
-        #    use Data::Dumper; print $i, ' ', $padnames[$i]->PVX, "\n"; # Dumper $padnames[0];
-        #}
-    # B::main_root()->linklist();
-        # walk_topdown($cv->ROOT, sub { $_[0]->concise($_[1]) }, 0); # in B::Concise
-        # goto not_pointcut unless $op->name() eq 'padav' or $op->name() eq 'padhv';
-        # goto not_pointcut unless OPf_WANT_SCALAR == ($op->flags() & OPf_WANT);
-        # goto not_pointcut if $op->flags & OPf_REF; # things like 'exists' want a ref
-        # XXX programmable selector
-    # our $testcv = B::svref_2object(sub { print "test!!\n"; });
-    # B::Concise::concise_cv_obj('basic', $testcv); # dump the opcode tree of this code value
-    # $newop = $newop->first->first->sibling if $newop->name eq 'leavesub'; # seek to the print
-    my %srcpad = do {
-        my @padnames = ($cv->PADLIST->ARRAY)[0]->ARRAY;
-        map { ( $_ => $padnames[$_]->PVX) }  grep { ! $padnames[$_]->isa('B::SPECIAL') } 0 .. $#padnames;
-    };
-    # map { ( $_ => $padnames[$_]->PVX) }  grep { $padnames[$_]->can('FLAGS') and $padnames[$_]->FLAGS & SVs_PADMY } 0 .. $#padnames;
-   # B::Concise::concise_cv_obj(0, $cv); # just to register the cv so when it goes to pick things out of the pad, it can
-   # B::Concise::walk_topdown($op, sub { $_[0]->concise($_[1]) }, 0); 
-                print $dp->indent($dp->deparse($op, 0));
-
         my $stringrep = do {
             my $cachedstringrep;
             sub {
@@ -601,5 +603,31 @@ Done:
 * Change instructions to use the pad of the routine they got moved into:
   Lookup variable names in the anonsub, find variables of the same names in the target sub's pad,
   and change the targ to match.
+
+............. the version of this above shouldn't be correct, but attempts at a corrected version of the rewriting the pads just hit brokenness and confusion.
+
+    walkoptree_slow($newcv->ROOT, sub {
+# XXXX redid the $op->targs in here to $idx; highly experimental; still have to change them elsewhere too if this works
+# XXX do this before we splice the code in?  so that we can stay contained to that?
+        my $op = shift or die;       # op object
+        return unless $op and $$op;
+warn "XXXX considering changing pad for an " . $op->name . " of class " . B::class($op); # "XXXX considering changing pad for an padav of class OP at /usr/local/lib/perl5/site_perl/5.16.1/Code/Splice.pm line 155."
+        # $op->can('targ') or return;  # B::NULL cannot
+# warn $op->name . " is a " . ref $op;
+        # ref($op) eq 'B::PADOP' or return;  # XXX highly experimental; we were screwing up apparently the refcnt on leavesubs, which use targ for that; nope, padav is a B::OP according to ref
+        # return if $op->name eq 'leavesub'; # XXX surely there are more
+        return if $op->name eq 'const'; # how are those making it through?  argh.
+        # return unless grep $_ eq B::class($op), 'SVOP', 'PADOP';  # nope, padvs come back with a class B::OP.
+        return if $op->name eq 'aelemfast' and $op->flags & OPf_SPECIAL; # no idea why; cargo culted from B::Concise
+        # my $idx = B::class($op) eq 'SVOP' ? $op->targ : $op->padix; # no idea; cargo culted from B::Concise XXX B.pm says padix is a method of B::SVOP; that means that this is backwards?!
+warn "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX changing pad for " . $op->name . " from $srcpad[$idx] to $destpad{$srcpad[$idx]}";
+        $srcpad[$idx] or return;
+        $debug and print "debug: ", $op->name, " references pad slot ", $idx, " which contains ", $srcpad[$idx]||'', "\n";
+        exists $destpad{$srcpad[$idx]} or die "variable ``$srcpad[$idx]'' doesn't exist in target context";
+        # $op->targ($destpad{$srcpad[$idx]});
+        if( B::class($op) eq 'SVOP' ) { $op->targ($destpad{$srcpad[$idx]}); } else { $op->padix($destpad{$srcpad[$idx]}); }
+        # print "debug: variable name: $srcpad[$idx]\n";
+        # print "debug: index of same variable in dest: ", $destpad{$srcpad{$idx}}, "\n";
+    });
 
 

@@ -6,6 +6,7 @@ use Code::Splice;
 {
     my @stuff;
     Code::Splice::inject(
+        # debug => 1,
         package => 'main', method => 'test',
         code => sub { 
             push @stuff, "fred";
